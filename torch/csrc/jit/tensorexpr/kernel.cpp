@@ -1386,6 +1386,89 @@ Tensor computePrepackedLinearClampRun(
   return Tensor(ResultBuf.node(), s);
 }
 
+Tensor computeQuantizePerTensor(
+    const std::vector<ArgValue>& inputs,
+    const std::vector<ExprHandle>& outputShape,
+    const c10::optional<ScalarType>& outputType) {
+  std::cout << "XXX " << __FUNCTION__ << std::endl;
+  auto output_sizes_expr = ExprHandleVectorToExprVector(outputShape);
+  std::vector<VarPtr> vars;
+  for (const auto& os : outputShape) {
+    vars.push_back(alloc<Var>(
+        "",
+        os.node()->dtype().scalar_type() == ScalarType::Long ? kLong : kInt));
+  }
+  std::cout << "XXX " << __FUNCTION__ <<  " outputType:" << *outputType << std::endl;
+  auto axes = VarVectorToVarHandleVector(vars);
+  std::vector<ExprHandle> indices(axes.begin(), axes.end());
+
+  auto qscale = constant(inputs[1]);
+  auto qzero = constant(inputs[2]);
+  // TODO: handle inputs[3] argument as dtype, asserts qint8, quint8
+  // TODO: optimize casts
+  auto dtype = Dtype(ScalarType::Byte);
+  // Q(x, scale, zero) = round(x / scale + zero)
+  const BufHandle& inp = c10::get<BufHandle>(inputs[0]);
+
+	auto inp_dtype = inp.node()->dtype();
+  qscale = promoteToDtype(qscale, inp_dtype.scalar_type());
+  qzero = promoteToDtype(qzero, inp_dtype.scalar_type());
+  ExprHandle exprHandle = promoteToDtype(
+      tensorOrConstant(inputs[0], indices) / qscale + qzero + FloatImm::make(0.5f),
+      dtype.scalar_type());
+
+  BufPtr buf = alloc<Buf>(
+      "quantize_per_tensor",
+      output_sizes_expr,
+      dtype,
+      nullptr,
+      qscale.node(),
+      qzero.node());
+  return Tensor(buf, vars, exprHandle.node());
+}
+
+Tensor computeDequantize(
+    const std::vector<ArgValue>& inputs,
+    const std::vector<ExprHandle>& outputShape,
+    const c10::optional<ScalarType>& outputType) {
+  Dtype dtype = kFloat;
+  if (outputType) {
+    dtype = Dtype(*outputType);
+  }
+  std::cout << "XXX " << __FUNCTION__ << std::endl;
+  for (const auto& arg : inputs) {
+    std::cout << "XXX " << getArgValueName(arg) << std::endl;
+  }
+  std::cout << "XXX " << __FUNCTION__ <<  " outputType:" << *outputType << std::endl;
+  auto qbuf = c10::get<BufHandle>(inputs[0]);
+  auto qscale = qbuf.node()->qscale();
+  auto qzero = qbuf.node()->qzero();
+  auto qbuf_dtype = qbuf.node()->dtype();
+  std::cout << "XXX qbuf_dtype:" << qbuf_dtype << std::endl;
+  // TODO: Use default dtype?
+  //auto dtype = Dtype(ScalarType::Float);
+  std::cout << "XXX qscale:" << qscale << std::endl;
+  std::cout << "XXX qzero:" << qzero << std::endl;
+  std::vector<VarPtr> vars;
+  for (const auto& os : outputShape) {
+    vars.push_back(alloc<Var>(
+        "",
+        os.node()->dtype().scalar_type() == ScalarType::Long ? kLong : kInt));
+  }
+  auto axes = VarVectorToVarHandleVector(vars);
+  std::vector<ExprHandle> indices(axes.begin(), axes.end());
+  auto qxf = promoteToDtype(tensorOrConstant(inputs[0], indices), dtype.scalar_type());
+  ExprHandle exprHandle = promoteToDtype(
+      (qxf - ExprHandle(qzero)) * ExprHandle(qscale),
+      dtype.scalar_type()
+  );
+  //ExprHandle exprHandle = promoteToDtype(tensorOrConstant(inputs[0], indices), dtype.scalar_type());
+
+  auto output_sizes_expr = ExprHandleVectorToExprVector(outputShape);
+  BufPtr buf = alloc<Buf>("dequantize", output_sizes_expr, dtype);
+  return Tensor(buf, vars, exprHandle.node());
+}
+
 Tensor tensorexpr::computeOperandValue(
     c10::Symbol op,
     const std::vector<ArgValue>& inputs,
@@ -2480,6 +2563,19 @@ Tensor tensorexpr::computeOperandValue(
     case aten::conv2d: {
       return computeConv2d(inputs, outputShape, outputType);
     } break;
+    case aten::linear: {
+      // linear = inputs[0] @ inputs[1] + inputs[2]
+      // addmm = beta(inputs[3]) * inputs[0] + alpha(inputs[4]) * inputs[1] @
+      // inputs[2]
+      std::vector<ArgValue> addmmInputs;
+      addmmInputs.reserve(5);
+      addmmInputs.push_back(inputs[2]);
+      addmmInputs.push_back(inputs[0]);
+      addmmInputs.push_back(inputs[1]);
+      addmmInputs.push_back(1l); // beta
+      addmmInputs.push_back(1l); // alpha
+      return computeAddMM(addmmInputs, outputShape, outputType);
+    } break;
     case aten::addmm: {
       return computeAddMM(inputs, outputShape, outputType);
     } break;
@@ -2489,6 +2585,18 @@ Tensor tensorexpr::computeOperandValue(
     case aten::adaptive_avg_pool2d: {
       return computeAdaptiveAvgPool2d(inputs, outputShape, outputType);
     } break;
+    case aten::quantize_per_tensor: {
+      return computeQuantizePerTensor(inputs, outputShape, outputType);
+    } break;
+    case aten::dequantize: {
+      return computeDequantize(inputs, outputShape, outputType);
+    } break;
+    default: {
+      std::string msg =
+          std::string("Unhandled node kind (in computeOperandValue): ") +
+          op.toQualString();
+      throw malformed_input(msg);
+    }
   }
   std::string msg =
       std::string("Unhandled node kind (in computeOperandValue): ") +
@@ -3134,7 +3242,6 @@ void TensorExprKernel::bindConstant(const torch::jit::Value* v) {
   for (auto s : sizes) {
     te_sizes.push_back(s);
   }
-
   BufPtr buf = alloc<Buf>(
       "const_" + sanitizeName(v->debugName()),
       ExprHandleVectorToExprVector(te_sizes),

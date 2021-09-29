@@ -14,8 +14,24 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <ATen/native/quantized/cpu/conv_packed_params.h>
+
 namespace torch {
 namespace jit {
+
+namespace {
+bool checkRtol(const at::Tensor& diff, const std::vector<at::Tensor> inputs) {
+  double maxValue = 0.0;
+  for (auto& tensor : inputs) {
+    maxValue = fmax(tensor.abs().max().item<float>(), maxValue);
+  }
+  return diff.abs().max().item<float>() < 2e-6 * maxValue;
+}
+
+bool almostEqual(const at::Tensor& a, const at::Tensor& b) {
+  return checkRtol(a - b, {a, b});
+}
+} // namespace
 
 using namespace torch::indexing;
 using namespace torch::jit::tensorexpr;
@@ -1636,6 +1652,288 @@ TEST_F(Kernel, DISABLED_FlattenVectorize) {
   }
 #endif
 }
+
+// TODO: Why Tensor(2, 2) does not work? Need dtype propagation?
+//%q.1 : Tensor(2, 2) = aten::quantize_per_tensor(%x.1, %4, %3, %2)
+TEST_F(Kernel, QuantDequant) {
+#ifdef TORCH_ENABLE_LLVM
+  const auto graph_string = R"IR(
+      graph(%x.1 : Float(2, 2, strides=[2, 1], device=cpu)):
+        %2 : int = prim::Constant[value=13]()
+        %3 : int = prim::Constant[value=130]()
+        %4 : float = prim::Constant[value=0.1]()
+        %q.1 : Float(2, 2) = aten::quantize_per_tensor(%x.1, %4, %3, %2)
+        %6 : Float(2, 2) = aten::dequantize(%q.1)
+        return (%6))IR";
+  auto graph = std::make_shared<Graph>();
+  parseIR(graph_string, &*graph);
+
+  auto x = at::rand({2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto q = at::quantize_per_tensor(x, 0.1f, 130, at::kQUInt8);
+  auto y_expected = at::dequantize(q);
+  TensorExprKernel k(graph);
+  std::vector<at::Tensor> inputs = {x};
+  StmtPtr s = k.getCodeGenStmt();
+
+  std::ostringstream oss;
+  oss << *s;
+
+  // Check the IR we produced
+  const std::string& verification_pattern =
+      R"IR(
+# CHECK: for
+# CHECK-NEXT: for
+# CHECK-NOT: for)IR";
+  torch::jit::testing::FileCheck().run(verification_pattern, oss.str());
+
+  std::vector<IValue> stack = fmap<IValue>(inputs);
+  k.run(stack);
+  auto y = stack[0].toTensor();
+  CHECK_EQ(almostEqual(y_expected, y), 1);
+#endif
+}
+
+at::Tensor quantized_add(
+    at::Tensor x1,
+    at::Tensor x2,
+    double scale,
+    int64_t zero) {
+  const auto qadd_op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("quantized::add", "")
+          .typed<at::Tensor(at::Tensor, at::Tensor, double, int64_t)>();
+  return qadd_op.call(x1, x2, scale, zero);
+}
+
+c10::intrusive_ptr<ConvPackedParamsBase<2>> quantized_conv2d_prepack(
+    at::Tensor weight,
+    c10::optional<at::Tensor> bias,
+    std::vector<int64_t> stride,
+    std::vector<int64_t> padding,
+    std::vector<int64_t> dilation,
+    int64_t groups) {
+  auto qconv2d_prepack_op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("quantized::conv2d_prepack", "")
+          .typed<c10::intrusive_ptr<ConvPackedParamsBase<2>>(
+              at::Tensor,
+              c10::optional<at::Tensor>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              int64_t)>();
+  return qconv2d_prepack_op.call(
+      weight, bias, stride, padding, dilation, groups);
+}
+
+at::Tensor quantized_conv2d(
+    at::Tensor qx,
+    c10::intrusive_ptr<ConvPackedParamsBase<2>> packed_weight,
+    double scale,
+    int64_t zero) {
+  auto qconv2d_op = c10::Dispatcher::singleton()
+                        .findSchemaOrThrow("quantized::conv2d", "")
+                        .typed<at::Tensor(
+                            at::Tensor,
+                            c10::intrusive_ptr<ConvPackedParamsBase<2>>,
+                            double,
+                            int64_t)>();
+  return qconv2d_op.call(qx, packed_weight, scale, zero);
+}
+
+at::Tensor quantized_conv2d_relu(
+    at::Tensor qx,
+    c10::intrusive_ptr<ConvPackedParamsBase<2>> packed_weight,
+    double scale,
+    int64_t zero) {
+  auto qconv2d_op = c10::Dispatcher::singleton()
+                        .findSchemaOrThrow("quantized::conv2d_relu", "")
+                        .typed<at::Tensor(
+                            at::Tensor,
+                            c10::intrusive_ptr<ConvPackedParamsBase<2>>,
+                            double,
+                            int64_t)>();
+  return qconv2d_op.call(qx, packed_weight, scale, zero);
+}
+
+TEST_F(Kernel, QuantConv2dReluDequant) {
+#ifdef TORCH_ENABLE_LLVM
+  const auto graph_string = R"IR(
+      graph(%x.1 : Float(1, 3, 2, 2, strides=[12, 4, 2, 1], device=cpu), %w : Float(2, 3, 2, 2, strides=[12, 4, 2, 1], device=cpu), %b : Float(2, strides=[1], device=cpu)):
+        %2 : int = prim::Constant[value=13]()
+        %qs.1 : int = prim::Constant[value=130]()
+        %qz.1 : float = prim::Constant[value=0.1]()
+        %qs.2 : int = prim::Constant[value=140]()
+        %qz.2 : float = prim::Constant[value=0.2]()
+        %s : int[] = prim::Constant[value=[1, 1]]()
+        %p : int[] = prim::Constant[value=[0, 0]]()
+        %d : int[] = prim::Constant[value=[1, 1]]()
+        %g : int = prim::Constant[value=1]()
+        %qcp : __torch__.torch.classes.quantized.Conv2dPackedParamsBase = torch.ops.quantized.conv2d_prepack(%w, %b, %s, %p, %d, %g)
+        %q.1 : Float(2, 2) = aten::quantize_per_tensor(%x.1, %qz.1, %qs.1, %2)
+        %qc : Float(2, 2) = quantized::conv2d_relu(%q.1, %qcp, %qz.2, %qs.1)
+        %6 : Float(2, 2) = aten::dequantize(%qc)
+        return (%6))IR";
+  auto graph = std::make_shared<Graph>();
+  parseIR(graph_string, &*graph);
+
+  auto x = at::rand({1, 3, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto w = at::rand({2, 3, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto b = at::rand({2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto q = at::quantize_per_tensor(x, 0.1f, 130, at::kQUInt8);
+  auto qcp = quantized_conv2d_prepack(w, b, {1, 1}, {0, 0}, {1, 1}, 1);
+  auto qc = quantized_conv2d_relu(q, qcp, 0.2f, 140);
+  auto y_expected = at::dequantize(q);
+
+  TensorExprKernel k(graph);
+  StmtPtr s = k.getCodeGenStmt();
+
+  std::ostringstream oss;
+  oss << *s;
+
+  // Check the IR we produced
+  const std::string& verification_pattern =
+      R"IR(
+# CHECK: for
+# CHECK-NEXT: for
+# CHECK-NOT: for)IR";
+  torch::jit::testing::FileCheck().run(verification_pattern, oss.str());
+
+  std::vector<IValue> stack = {IValue(x), IValue(w), IValue(b)};
+  k.run(stack);
+  auto y = stack[0].toTensor();
+  CHECK_EQ(almostEqual(y_expected, y), 1);
+#endif
+}
+
+TEST_F(Kernel, QuantConv2dDequant) {
+#ifdef TORCH_ENABLE_LLVM
+  const auto graph_string = R"IR(
+      graph(%x.1 : Float(2, 2, strides=[2, 1], device=cpu), %qcp : __torch__.torch.classes.quantized.Conv2dPackedParamsBase):
+        %2 : int = prim::Constant[value=13]()
+        %qs.1 : int = prim::Constant[value=130]()
+        %qz.1 : float = prim::Constant[value=0.1]()
+        %qs.2 : int = prim::Constant[value=140]()
+        %qz.2 : float = prim::Constant[value=0.2]()
+        %q.1 : Float(2, 2) = aten::quantize_per_tensor(%x.1, %qz.1, %qs.1, %2)
+        %qc : Float(2, 2) = quantized::conv2d(%q.1, %qcp, %qz.2, %qs.1)
+        %6 : Float(2, 2) = aten::dequantize(%qc)
+        return (%6))IR";
+  auto graph = std::make_shared<Graph>();
+  parseIR(graph_string, &*graph);
+
+  auto x = at::rand({1, 3, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto w = at::rand({2, 3, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto b = at::rand({2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto q = at::quantize_per_tensor(x, 0.1f, 130, at::kQUInt8);
+  auto qcp = quantized_conv2d_prepack(w, b, {1, 1}, {0, 0}, {1, 1}, 1);
+  auto qc = quantized_conv2d(q, qcp, 0.2f, 140);
+  auto y_expected = at::dequantize(q);
+
+  TensorExprKernel k(graph);
+  StmtPtr s = k.getCodeGenStmt();
+
+  std::ostringstream oss;
+  oss << *s;
+
+  // Check the IR we produced
+  const std::string& verification_pattern =
+      R"IR(
+# CHECK: for
+# CHECK-NEXT: for
+# CHECK-NOT: for)IR";
+  torch::jit::testing::FileCheck().run(verification_pattern, oss.str());
+
+  std::vector<IValue> stack = {IValue(x), IValue(qcp)};
+  k.run(stack);
+  auto y = stack[0].toTensor();
+  CHECK_EQ(almostEqual(y_expected, y), 1);
+#endif
+}
+
+TEST_F(Kernel, QuantAddDequant) {
+#ifdef TORCH_ENABLE_LLVM
+  const auto graph_string = R"IR(
+      graph(%x.1 : Float(2, 2, strides=[2, 1], device=cpu), %x.2 : Float(2, 2, strides=[2, 1], device=cpu)):
+        %2 : int = prim::Constant[value=13]()
+        %qz.1 : int = prim::Constant[value=130]()
+        %qs.1 : float = prim::Constant[value=0.1]()
+        %qz.2 : int = prim::Constant[value=140]()
+        %qs.2 : float = prim::Constant[value=0.2]()
+        %qz.a : int = prim::Constant[value=145]()
+        %qs.a : float = prim::Constant[value=0.3]()
+        %q.1 : Float(2, 2) = aten::quantize_per_tensor(%x.1, %qz.1, %qs.1, %2)
+        %q.2 : Float(2, 2) = aten::quantize_per_tensor(%x.2, %qz.2, %qs.2, %2)
+        %qa : Float(2, 2) = quantized::add(%q.1, %q.2, %qs.a, %qz.a)
+        %6 : Float(2, 2) = aten::dequantize(%qa)
+        return (%6))IR";
+  auto graph = std::make_shared<Graph>();
+  parseIR(graph_string, &*graph);
+
+  auto x1 = at::rand({2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto x2 = at::rand({2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto q1 = at::quantize_per_tensor(x1, 0.1f, 130, at::kQUInt8);
+  auto q2 = at::quantize_per_tensor(x2, 0.2f, 140, at::kQUInt8);
+  auto qa = quantized_add(q1, q2, 0.3f, 145);
+  auto y_expected = at::dequantize(qa);
+  TensorExprKernel k(graph);
+  std::vector<at::Tensor> inputs = {x1, x2};
+  StmtPtr s = k.getCodeGenStmt();
+
+  std::ostringstream oss;
+  oss << *s;
+
+  // Check the IR we produced
+  const std::string& verification_pattern =
+      R"IR(
+# CHECK: for
+# CHECK-NEXT: for
+# CHECK-NOT: for)IR";
+  torch::jit::testing::FileCheck().run(verification_pattern, oss.str());
+
+  std::vector<IValue> stack = fmap<IValue>(inputs);
+  k.run(stack);
+  auto y = stack[0].toTensor();
+  CHECK_EQ(almostEqual(y_expected, y), 1);
+#endif
+}
+/*
+TEST_F(Kernel, Quant) {
+#ifdef TORCH_ENABLE_LLVM
+  const auto graph_string = R"IR(
+      graph(%x.1 : Float(2, 2, strides=[2, 1], device=cpu)):
+        %2 : int = prim::Constant[value=13]()
+        %3 : int = prim::Constant[value=130]()
+        %4 : float = prim::Constant[value=0.1]()
+        %q.1 : Float(2, 2) = aten::quantize_per_tensor(%x.1, %4, %3, %2)
+        return (%q.1))IR";
+  auto graph = std::make_shared<Graph>();
+  parseIR(graph_string, &*graph);
+
+  auto x = at::rand({2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto y_expected = at::quantize_per_tensor(x, 0.1f, 130, at::kQUInt8);
+  TensorExprKernel k(graph);
+  std::vector<at::Tensor> inputs = {x};
+  StmtPtr s = k.getCodeGenStmt();
+
+  std::ostringstream oss;
+  oss << *s;
+
+  // Check the IR we produced
+  const std::string& verification_pattern =
+      R"IR(
+# CHECK: for
+# CHECK-NEXT: for
+# CHECK-NOT: for)IR";
+  torch::jit::testing::FileCheck().run(verification_pattern, oss.str());
+
+  std::vector<IValue> stack = fmap<IValue>(inputs);
+  k.run(stack);
+  auto y = stack[0].toTensor();
+  CHECK_EQ(almostEqual(y_expected, y), 1);
+#endif
+}
+*/
 
 } // namespace jit
 } // namespace torch
